@@ -2,13 +2,11 @@ import asyncio, os, pickle, random
 from datetime import datetime
 
 import httpx
-import numpy as np
 from dotenv import load_dotenv
 from fastapi import FastAPI, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.staticfiles import StaticFiles
 from fastapi.responses import FileResponse
-from supabase import create_client
 
 load_dotenv()
 
@@ -22,16 +20,15 @@ app.add_middleware(CORSMiddleware, allow_origins=["*"], allow_methods=["*"], all
 if os.path.exists("front"):
     app.mount("/static", StaticFiles(directory="front"), name="static")
 
-
     @app.get("/")
     async def serve_frontend():
         """Servir le frontend PulseBoard"""
         return FileResponse('front/index.html')
 
 # constants
-SUPABASE_URL = os.getenv("SUPABASE_URL")
-SUPABASE_KEY = os.getenv("SUPABASE_KEY")
-db = create_client(SUPABASE_URL, SUPABASE_KEY)
+# SUPABASE_URL = os.getenv("SUPABASE_URL")
+# SUPABASE_KEY = os.getenv("SUPABASE_KEY")
+# db = create_client(SUPABASE_URL, SUPABASE_KEY)
 
 OWM = os.getenv("OPENWEATHER_API_KEY")
 AGENDA = os.getenv("OPENAGENDA_API_KEY")
@@ -46,12 +43,8 @@ CITIES = {
 }
 
 # pour le model ML, change a ton plaisir frr
-try:
-    with open("ml/model.pkl", "rb") as f:
-        MODEL = pickle.load(f)
-except Exception:
-    MODEL = None
-
+# MODEL désactivé temporairement (nécessite numpy)
+MODEL = None
 
 # helpeurs
 
@@ -310,18 +303,16 @@ async def get_score(city: str):
 async def get_predict(city: str):
     """
     AQI prediction for the next 6 hours.
-    Uses Oceane's scikit-learn model if available, otherwise a simple estimate.
+    Uses simple estimation since ML model requires numpy.
     """
     city = city_or_404(city)
     air = await get_air(city)
     cur = air["aqi"]
 
-    if MODEL is not None:
-        predicted = float(MODEL.predict(np.array([[cur, air["pm25"], air["no2"]]]))[0])
-        confidence = 78
-    else:
-        predicted = round(cur * (1 + random.uniform(-0.08, 0.08)), 1)
-        confidence = 60
+    # Prédiction simplifiée sans numpy ni ML
+    predicted = round(cur * (1 + random.uniform(-0.08, 0.08)), 1)
+    confidence = 60
+    
     forecast, val = [], predicted
     for h in range(1, 7):
         val = max(0, round(val + random.uniform(-4, 4), 1))
@@ -337,6 +328,13 @@ async def get_predict(city: str):
         "confidence": confidence,
         "color": meta["color"],
         "label": meta["label"],
-        "model": "scikit-learn" if MODEL else "fallback",
+        "model": "fallback",
         "updated_at": datetime.utcnow().isoformat(),
     }
+
+
+# Point d'entrée pour Vercel/autres plateformes
+if __name__ == "__main__":
+    import uvicorn
+    port = int(os.environ.get("PORT", 8000))
+    uvicorn.run(app, host="0.0.0.0", port=port)
