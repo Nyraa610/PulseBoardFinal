@@ -26,10 +26,30 @@ if os.path.exists("front"):
         """Servir le frontend PulseBoard"""
         return FileResponse('front/index.html')
 
-# constants
+# Configuration Supabase
 SUPABASE_URL = os.getenv("SUPABASE_URL")
 SUPABASE_KEY = os.getenv("SUPABASE_KEY")
-db = create_client(SUPABASE_URL, SUPABASE_KEY) if SUPABASE_URL and SUPABASE_KEY else None
+
+def init_supabase():
+    """Initialise Supabase de manière sécurisée"""
+    if not SUPABASE_URL or not SUPABASE_KEY:
+        print("⚠️ Variables Supabase manquantes")
+        return None
+    
+    if not SUPABASE_URL.startswith('https://'):
+        print(f"⚠️ URL Supabase invalide: {SUPABASE_URL}")
+        return None
+    
+    try:
+        client = create_client(SUPABASE_URL, SUPABASE_KEY)
+        print("✅ Supabase connecté")
+        return client
+    except Exception as e:
+        print(f"❌ Erreur Supabase: {e}")
+        return None
+
+# Initialisation sécurisée
+db = init_supabase()
 
 OWM = os.getenv("OPENWEATHER_API_KEY")
 AGENDA = os.getenv("OPENAGENDA_API_KEY")
@@ -129,6 +149,17 @@ def health():
         "status": "ok", 
         "time": datetime.utcnow().isoformat(),
         "supabase": "connected" if db else "not configured"
+    }
+
+
+@app.get("/api/debug/supabase")
+async def debug_supabase():
+    """Debug de la connexion Supabase"""
+    return {
+        "supabase_configured": db is not None,
+        "supabase_url": SUPABASE_URL if SUPABASE_URL else "NOT_SET",
+        "supabase_key_length": len(SUPABASE_KEY) if SUPABASE_KEY else 0,
+        "url_valid": SUPABASE_URL.startswith('https://') if SUPABASE_URL else False
     }
 
 
