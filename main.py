@@ -2,14 +2,11 @@ import asyncio, os, pickle, random
 from datetime import datetime
 
 import httpx
-from dotenv import load_dotenv
 from fastapi import FastAPI, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.staticfiles import StaticFiles
 from fastapi.responses import FileResponse
 from supabase import create_client
-
-load_dotenv()
 
 # app
 app = FastAPI(title="PulseBoard API", version="1.0.0")
@@ -32,6 +29,14 @@ SUPABASE_KEY = os.getenv("SUPABASE_KEY")
 
 def init_supabase():
     """Initialise Supabase de manière sécurisée"""
+    print(f"🔍 SUPABASE_URL exists: {SUPABASE_URL is not None}")
+    print(f"🔍 SUPABASE_KEY exists: {SUPABASE_KEY is not None}")
+    
+    if SUPABASE_URL:
+        print(f"🔍 URL preview: {SUPABASE_URL[:30]}...")
+    if SUPABASE_KEY:
+        print(f"🔍 KEY preview: {SUPABASE_KEY[:20]}...")
+    
     if not SUPABASE_URL or not SUPABASE_KEY:
         print("⚠️ Variables Supabase manquantes")
         return None
@@ -41,11 +46,12 @@ def init_supabase():
         return None
     
     try:
+        print("🔧 Tentative de connexion...")
         client = create_client(SUPABASE_URL, SUPABASE_KEY)
-        print("✅ Supabase connecté")
+        print("✅ Supabase connecté avec succès")
         return client
     except Exception as e:
-        print(f"❌ Erreur Supabase: {e}")
+        print(f"❌ Erreur Supabase: {type(e).__name__}: {e}")
         return None
 
 # Initialisation sécurisée
@@ -160,6 +166,16 @@ async def debug_supabase():
         "supabase_url": SUPABASE_URL if SUPABASE_URL else "NOT_SET",
         "supabase_key_length": len(SUPABASE_KEY) if SUPABASE_KEY else 0,
         "url_valid": SUPABASE_URL.startswith('https://') if SUPABASE_URL else False
+    }
+
+
+@app.get("/api/debug/openagenda")
+async def debug_openagenda():
+    """Debug OpenAgenda API"""
+    return {
+        "openagenda_key_configured": AGENDA is not None,
+        "openagenda_key_length": len(AGENDA) if AGENDA else 0,
+        "openagenda_key_preview": AGENDA[:10] + "..." if AGENDA else "NOT_SET"
     }
 
 
@@ -328,24 +344,36 @@ async def get_events(city: str):
     """Next 5 public events from OpenAgenda. Returns empty list if API is down."""
     city = city_or_404(city)
 
+    if not AGENDA:
+        events_data = {"city": city, "events": [], "warning": "OpenAgenda API key not configured",
+                      "updated_at": datetime.utcnow().isoformat()}
+        await save_to_db(city, 'events', events_data)
+        return events_data
+
     async with httpx.AsyncClient(timeout=10) as c:
         r = await c.get(
             "https://api.openagenda.com/v2/events",
             params={
-                "key": AGENDA, "search[city]": city.capitalize(),
-                "size": 5, "sort": "timingsWithFeatured.asc",
+                "key": AGENDA, 
+                "q": city.capitalize(),  # Recherche plus large
+                "size": 10,
+                "sort": "timingsWithFeatured.asc",
             },
         )
 
     # pas fatal, peut-etre, probablement, j'espere, maybe
     if r.status_code != 200:
-        events_data = {"city": city, "events": [], "warning": "OpenAgenda unavailable",
+        print(f"❌ OpenAgenda error {r.status_code}: {r.text}")
+        events_data = {"city": city, "events": [], "warning": f"OpenAgenda error: {r.status_code}",
                       "updated_at": datetime.utcnow().isoformat()}
         await save_to_db(city, 'events', events_data)
         return events_data
 
     events = []
-    for item in r.json().get("events", [])[:5]:
+    raw_events = r.json().get("events", [])
+    print(f"📊 OpenAgenda found {len(raw_events)} events for {city}")
+    
+    for item in raw_events[:5]:
         title = item.get("title", {})
         title = (title.get("fr") or title.get("en") or "Evenement") if isinstance(title, dict) else title
         location = item.get("location", {})
