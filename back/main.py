@@ -1,25 +1,23 @@
-
-import os
-import asyncio
-from datetime import datetime
 from fastapi import FastAPI, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
-from fastapi.responses import JSONResponse
-from pydantic import BaseModel
-from typing import List, Optional
-import httpx
+from supabase import create_client, Client
+import os
+from datetime import datetime
+from typing import Dict, Any, List, Optional
+import logging
 
-# Import Supabase
-try:
-    from supabase import create_client, Client
-    SUPABASE_AVAILABLE = True
-except ImportError as e:
-    SUPABASE_AVAILABLE = False
-    SUPABASE_IMPORT_ERROR = str(e)
+# Configuration du logging
+logging.basicConfig(level=logging.INFO)
+logger = logging.getLogger(__name__)
 
+# Configuration Supabase
+SUPABASE_URL = os.getenv("SUPABASE_URL")
+SUPABASE_KEY = os.getenv("SUPABASE_KEY")
+
+# Initialisation de l'application FastAPI
 app = FastAPI(title="PulseBoard API", version="1.0.0")
 
-# CORS
+# Configuration CORS
 app.add_middleware(
     CORSMiddleware,
     allow_origins=["*"],
@@ -28,63 +26,49 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
-# Configuration Supabase
-SUPABASE_URL = os.getenv("SUPABASE_URL")
-SUPABASE_KEY = os.getenv("SUPABASE_KEY")
+# Client Supabase global
+supabase: Optional[Client] = None
 
-# Variables globales
-supabase_client = None
-supabase_error = None
-
-# Initialisation Supabase
-if SUPABASE_AVAILABLE and SUPABASE_URL and SUPABASE_KEY:
+def init_supabase():
+    """Initialise le client Supabase"""
+    global supabase
     try:
-        supabase_client = create_client(SUPABASE_URL, SUPABASE_KEY)
-        print("✅ Supabase client créé avec succès")
+        if SUPABASE_URL and SUPABASE_KEY:
+            # AUCUN PARAMETRE PROXY - JUSTE URL ET KEY
+            supabase = create_client(SUPABASE_URL, SUPABASE_KEY)
+            logger.info("✅ Supabase client initialized successfully")
+            return True
+        else:
+            logger.warning("❌ Supabase credentials not found")
+            return False
     except Exception as e:
-        supabase_error = str(e)
-        print(f"❌ Erreur création client Supabase: {e}")
-else:
-    if not SUPABASE_AVAILABLE:
-        supabase_error = f"Supabase non disponible: {SUPABASE_IMPORT_ERROR}"
-    else:
-        supabase_error = "Variables d'environnement manquantes"
+        logger.error(f"❌ Failed to initialize Supabase: {e}")
+        return False
 
-# Models
-class Task(BaseModel):
-    id: Optional[int] = None
-    title: str
-    description: Optional[str] = None
-    status: str = "todo"
-    priority: str = "medium"
-    assigned_to: Optional[str] = None
-    due_date: Optional[str] = None
-    created_at: Optional[str] = None
+# Initialisation au démarrage
+init_supabase()
 
-class TaskUpdate(BaseModel):
-    title: Optional[str] = None
-    description: Optional[str] = None
-    status: Optional[str] = None
-    priority: Optional[str] = None
-    assigned_to: Optional[str] = None
-    due_date: Optional[str] = None
-
-# Routes principales
 @app.get("/")
 async def root():
-    return {"message": "PulseBoard API is running!", "version": "1.0.0"}
+    """Point d'entrée principal"""
+    return {
+        "message": "PulseBoard API is running!",
+        "version": "1.0.0",
+        "status": "active"
+    }
 
 @app.get("/health")
 async def health_check():
+    """Vérification de l'état de l'API"""
     return {
         "status": "healthy",
-        "supabase_configured": supabase_client is not None,
-        "timestamp": datetime.utcnow().isoformat() + "Z"
+        "supabase_configured": supabase is not None,
+        "timestamp": datetime.now().isoformat() + "Z"
     }
 
-# Routes de debug
 @app.get("/api/debug/env")
 async def debug_env():
+    """Debug des variables d'environnement"""
     return {
         "supabase_url": SUPABASE_URL[:50] + "..." if SUPABASE_URL else None,
         "supabase_key_length": len(SUPABASE_KEY) if SUPABASE_KEY else 0,
@@ -96,111 +80,95 @@ async def debug_env():
 
 @app.get("/api/debug/supabase")
 async def debug_supabase():
-    result = {
-        "supabase_url": SUPABASE_URL,
-        "supabase_key_length": len(SUPABASE_KEY) if SUPABASE_KEY else 0,
-        "supabase_key_start": SUPABASE_KEY[:20] + "..." if SUPABASE_KEY else None,
-        "url_valid": bool(SUPABASE_URL and SUPABASE_URL.startswith("https://")),
-        "supabase_configured": supabase_client is not None,
-        "supabase_available": SUPABASE_AVAILABLE,
-        "supabase_error": supabase_error
-    }
-    
-    # Test de connexion
-    if supabase_client:
-        try:
-            # Test simple
-            response = supabase_client.table("tasks").select("*").limit(1).execute()
-            result["connection_test"] = "success"
-            result["table_accessible"] = True
-        except Exception as e:
-            result["connection_test"] = "failed"
-            result["connection_error"] = str(e)
-            result["table_accessible"] = False
-    
-    return result
-
-# Routes des tâches
-@app.get("/api/tasks", response_model=List[Task])
-async def get_tasks():
-    if not supabase_client:
-        raise HTTPException(status_code=503, detail="Supabase non configuré")
-    
+    """Debug complet de Supabase"""
     try:
-        response = supabase_client.table("tasks").select("*").execute()
-        return response.data
-    except Exception as e:
-        raise HTTPException(status_code=500, detail=f"Erreur récupération tâches: {str(e)}")
-
-@app.post("/api/tasks", response_model=Task)
-async def create_task(task: Task):
-    if not supabase_client:
-        raise HTTPException(status_code=503, detail="Supabase non configuré")
-    
-    try:
-        task_data = task.dict(exclude={'id', 'created_at'})
-        response = supabase_client.table("tasks").insert(task_data).execute()
-        return response.data[0]
-    except Exception as e:
-        raise HTTPException(status_code=500, detail=f"Erreur création tâche: {str(e)}")
-
-@app.get("/api/tasks/{task_id}", response_model=Task)
-async def get_task(task_id: int):
-    if not supabase_client:
-        raise HTTPException(status_code=503, detail="Supabase non configuré")
-    
-    try:
-        response = supabase_client.table("tasks").select("*").eq("id", task_id).execute()
-        if not response.data:
-            raise HTTPException(status_code=404, detail="Tâche non trouvée")
-        return response.data[0]
-    except HTTPException:
-        raise
-    except Exception as e:
-        raise HTTPException(status_code=500, detail=f"Erreur récupération tâche: {str(e)}")
-
-@app.put("/api/tasks/{task_id}", response_model=Task)
-async def update_task(task_id: int, task_update: TaskUpdate):
-    if not supabase_client:
-        raise HTTPException(status_code=503, detail="Supabase non configuré")
-    
-    try:
-        update_data = {k: v for k, v in task_update.dict().items() if v is not None}
-        if not update_data:
-            raise HTTPException(status_code=400, detail="Aucune donnée à mettre à jour")
+        result = {
+            "supabase_url": SUPABASE_URL,
+            "supabase_key_length": len(SUPABASE_KEY) if SUPABASE_KEY else 0,
+            "supabase_key_start": SUPABASE_KEY[:20] + "..." if SUPABASE_KEY else None,
+            "url_valid": bool(SUPABASE_URL and SUPABASE_URL.startswith("https://")),
+            "supabase_configured": False,
+            "supabase_available": False,
+            "supabase_error": None
+        }
         
-        response = supabase_client.table("tasks").update(update_data).eq("id", task_id).execute()
-        if not response.data:
-            raise HTTPException(status_code=404, detail="Tâche non trouvée")
-        return response.data[0]
-    except HTTPException:
-        raise
+        if not SUPABASE_URL or not SUPABASE_KEY:
+            result["supabase_error"] = "Missing SUPABASE_URL or SUPABASE_KEY"
+            return result
+        
+        # Test de création du client Supabase - SANS PROXY
+        test_client = create_client(SUPABASE_URL, SUPABASE_KEY)
+        result["supabase_available"] = True
+        result["supabase_configured"] = True
+        
+        return result
+        
     except Exception as e:
-        raise HTTPException(status_code=500, detail=f"Erreur mise à jour tâche: {str(e)}")
+        result["supabase_error"] = str(e)
+        return result
 
-@app.delete("/api/tasks/{task_id}")
-async def delete_task(task_id: int):
-    if not supabase_client:
-        raise HTTPException(status_code=503, detail="Supabase non configuré")
-    
-    try:
-        response = supabase_client.table("tasks").delete().eq("id", task_id).execute()
-        if not response.data:
-            raise HTTPException(status_code=404, detail="Tâche non trouvée")
-        return {"message": "Tâche supprimée avec succès"}
-    except HTTPException:
-        raise
-    except Exception as e:
-        raise HTTPException(status_code=500, detail=f"Erreur suppression tâche: {str(e)}")
-
-# Route de test
 @app.get("/api/test")
 async def test_api():
+    """Test général de l'API"""
     return {
-        "status": "API fonctionnelle",
-        "supabase": "configuré" if supabase_client else "non configuré",
-        "timestamp": datetime.utcnow().isoformat()
+        "api_status": "working",
+        "supabase_status": "configured" if supabase else "not_configured",
+        "timestamp": datetime.now().isoformat()
     }
+
+# Routes pour les événements
+@app.get("/api/events")
+async def get_events():
+    """Récupère tous les événements"""
+    if not supabase:
+        raise HTTPException(status_code=500, detail="Supabase not configured")
+    
+    try:
+        response = supabase.table("events").select("*").execute()
+        return {"events": response.data}
+    except Exception as e:
+        logger.error(f"Error fetching events: {e}")
+        raise HTTPException(status_code=500, detail=str(e))
+
+@app.post("/api/events")
+async def create_event(event_data: Dict[str, Any]):
+    """Crée un nouvel événement"""
+    if not supabase:
+        raise HTTPException(status_code=500, detail="Supabase not configured")
+    
+    try:
+        response = supabase.table("events").insert(event_data).execute()
+        return {"message": "Event created successfully", "data": response.data}
+    except Exception as e:
+        logger.error(f"Error creating event: {e}")
+        raise HTTPException(status_code=500, detail=str(e))
+
+# Routes pour les métriques
+@app.get("/api/metrics")
+async def get_metrics():
+    """Récupère toutes les métriques"""
+    if not supabase:
+        raise HTTPException(status_code=500, detail="Supabase not configured")
+    
+    try:
+        response = supabase.table("metrics").select("*").execute()
+        return {"metrics": response.data}
+    except Exception as e:
+        logger.error(f"Error fetching metrics: {e}")
+        raise HTTPException(status_code=500, detail=str(e))
+
+@app.post("/api/metrics")
+async def create_metric(metric_data: Dict[str, Any]):
+    """Crée une nouvelle métrique"""
+    if not supabase:
+        raise HTTPException(status_code=500, detail="Supabase not configured")
+    
+    try:
+        response = supabase.table("metrics").insert(metric_data).execute()
+        return {"message": "Metric created successfully", "data": response.data}
+    except Exception as e:
+        logger.error(f"Error creating metric: {e}")
+        raise HTTPException(status_code=500, detail=str(e))
 
 if __name__ == "__main__":
     import uvicorn
