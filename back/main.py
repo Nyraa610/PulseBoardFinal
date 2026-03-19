@@ -1,238 +1,206 @@
+
 import os
-from fastapi import FastAPI, HTTPException, Request
-from fastapi.responses import HTMLResponse, JSONResponse
-from fastapi.staticfiles import StaticFiles
-from fastapi.templating import Jinja2Templates
-import httpx
+import asyncio
 from datetime import datetime
-import json
-from typing import Dict, Any, List, Optional
+from fastapi import FastAPI, HTTPException
+from fastapi.middleware.cors import CORSMiddleware
+from fastapi.responses import JSONResponse
 from pydantic import BaseModel
-import logging
+from typing import List, Optional
+import httpx
 
-# Configuration du logging
-logging.basicConfig(level=logging.INFO)
-logger = logging.getLogger(__name__)
+# Import Supabase
+try:
+    from supabase import create_client, Client
+    SUPABASE_AVAILABLE = True
+except ImportError as e:
+    SUPABASE_AVAILABLE = False
+    SUPABASE_IMPORT_ERROR = str(e)
 
-app = FastAPI(title="PulseBoard", version="1.0.0")
+app = FastAPI(title="PulseBoard API", version="1.0.0")
 
-# Configuration des templates
-templates = Jinja2Templates(directory="templates")
+# CORS
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=["*"],
+    allow_credentials=True,
+    allow_methods=["*"],
+    allow_headers=["*"],
+)
 
 # Configuration Supabase
 SUPABASE_URL = os.getenv("SUPABASE_URL")
 SUPABASE_KEY = os.getenv("SUPABASE_KEY")
 
-# Client Supabase global
+# Variables globales
 supabase_client = None
+supabase_error = None
 
-def init_supabase():
-    """Initialise le client Supabase de manière sécurisée"""
-    global supabase_client
+# Initialisation Supabase
+if SUPABASE_AVAILABLE and SUPABASE_URL and SUPABASE_KEY:
     try:
-        if not SUPABASE_URL or not SUPABASE_KEY:
-            logger.error("Variables Supabase manquantes")
-            return False
-            
-        from supabase import create_client
-        
-        # Création du client SANS paramètres problématiques
         supabase_client = create_client(SUPABASE_URL, SUPABASE_KEY)
-        
-        # Test simple de connexion
-        result = supabase_client.table("pulse_data").select("*").limit(1).execute()
-        logger.info("Supabase connecté avec succès")
-        return True
-        
+        print("✅ Supabase client créé avec succès")
     except Exception as e:
-        logger.error(f"Erreur Supabase: {str(e)}")
-        supabase_client = None
-        return False
+        supabase_error = str(e)
+        print(f"❌ Erreur création client Supabase: {e}")
+else:
+    if not SUPABASE_AVAILABLE:
+        supabase_error = f"Supabase non disponible: {SUPABASE_IMPORT_ERROR}"
+    else:
+        supabase_error = "Variables d'environnement manquantes"
 
-# Initialisation au démarrage
-supabase_configured = init_supabase()
+# Models
+class Task(BaseModel):
+    id: Optional[int] = None
+    title: str
+    description: Optional[str] = None
+    status: str = "todo"
+    priority: str = "medium"
+    assigned_to: Optional[str] = None
+    due_date: Optional[str] = None
+    created_at: Optional[str] = None
 
-# Modèles Pydantic
-class PulseData(BaseModel):
-    timestamp: str
-    heart_rate: int
-    blood_pressure_systolic: int
-    blood_pressure_diastolic: int
-    temperature: float
-    oxygen_saturation: int
+class TaskUpdate(BaseModel):
+    title: Optional[str] = None
+    description: Optional[str] = None
+    status: Optional[str] = None
+    priority: Optional[str] = None
+    assigned_to: Optional[str] = None
+    due_date: Optional[str] = None
 
-class HealthMetrics(BaseModel):
-    avg_heart_rate: float
-    avg_temperature: float
-    avg_oxygen_saturation: float
-    latest_blood_pressure: Dict[str, int]
-    total_readings: int
-
-@app.get("/", response_class=HTMLResponse)
-async def dashboard(request: Request):
-    """Page principale du dashboard"""
-    return templates.TemplateResponse("dashboard.html", {"request": request})
+# Routes principales
+@app.get("/")
+async def root():
+    return {"message": "PulseBoard API is running!", "version": "1.0.0"}
 
 @app.get("/health")
 async def health_check():
-    """Endpoint de vérification de santé"""
     return {
         "status": "healthy",
-        "timestamp": datetime.now().isoformat(),
-        "supabase_configured": supabase_configured,
-        "version": "1.0.0"
+        "supabase_configured": supabase_client is not None,
+        "timestamp": datetime.utcnow().isoformat() + "Z"
+    }
+
+# Routes de debug
+@app.get("/api/debug/env")
+async def debug_env():
+    return {
+        "supabase_url": SUPABASE_URL[:50] + "..." if SUPABASE_URL else None,
+        "supabase_key_length": len(SUPABASE_KEY) if SUPABASE_KEY else 0,
+        "supabase_key_start": SUPABASE_KEY[:20] + "..." if SUPABASE_KEY else None,
+        "url_valid": bool(SUPABASE_URL and SUPABASE_URL.startswith("https://")),
+        "key_valid": bool(SUPABASE_KEY and len(SUPABASE_KEY) > 100),
+        "all_env_vars": list(os.environ.keys())
     }
 
 @app.get("/api/debug/supabase")
 async def debug_supabase():
-    """Debug détaillé de Supabase"""
-    try:
-        debug_info = {
-            "supabase_url": SUPABASE_URL,
-            "supabase_key_length": len(SUPABASE_KEY) if SUPABASE_KEY else 0,
-            "supabase_key_start": SUPABASE_KEY[:20] + "..." if SUPABASE_KEY else None,
-            "url_valid": bool(SUPABASE_URL and SUPABASE_URL.startswith("https://")),
-            "supabase_configured": supabase_configured
-        }
-        
-        # Test de connexion en temps réel
-        if supabase_client:
-            try:
-                result = supabase_client.table("pulse_data").select("*").limit(1).execute()
-                debug_info["connection_test"] = "success"
-                debug_info["table_accessible"] = True
-            except Exception as e:
-                debug_info["connection_test"] = "failed"
-                debug_info["connection_error"] = str(e)
-                debug_info["error_type"] = type(e).__name__
-        else:
-            debug_info["connection_test"] = "no_client"
-            
-        return debug_info
-        
-    except Exception as e:
-        return {
-            "error": str(e),
-            "error_type": type(e).__name__,
-            "supabase_configured": False
-        }
+    result = {
+        "supabase_url": SUPABASE_URL,
+        "supabase_key_length": len(SUPABASE_KEY) if SUPABASE_KEY else 0,
+        "supabase_key_start": SUPABASE_KEY[:20] + "..." if SUPABASE_KEY else None,
+        "url_valid": bool(SUPABASE_URL and SUPABASE_URL.startswith("https://")),
+        "supabase_configured": supabase_client is not None,
+        "supabase_available": SUPABASE_AVAILABLE,
+        "supabase_error": supabase_error
+    }
+    
+    # Test de connexion
+    if supabase_client:
+        try:
+            # Test simple
+            response = supabase_client.table("tasks").select("*").limit(1).execute()
+            result["connection_test"] = "success"
+            result["table_accessible"] = True
+        except Exception as e:
+            result["connection_test"] = "failed"
+            result["connection_error"] = str(e)
+            result["table_accessible"] = False
+    
+    return result
 
-@app.post("/api/pulse")
-async def add_pulse_data(data: PulseData):
-    """Ajouter des données de pouls"""
-    if not supabase_configured or not supabase_client:
-        raise HTTPException(status_code=503, detail="Supabase not configured")
+# Routes des tâches
+@app.get("/api/tasks", response_model=List[Task])
+async def get_tasks():
+    if not supabase_client:
+        raise HTTPException(status_code=503, detail="Supabase non configuré")
     
     try:
-        # Insérer les données
-        result = supabase_client.table("pulse_data").insert({
-            "timestamp": data.timestamp,
-            "heart_rate": data.heart_rate,
-            "blood_pressure_systolic": data.blood_pressure_systolic,
-            "blood_pressure_diastolic": data.blood_pressure_diastolic,
-            "temperature": data.temperature,
-            "oxygen_saturation": data.oxygen_saturation
-        }).execute()
-        
-        return {"status": "success", "data": result.data}
-        
+        response = supabase_client.table("tasks").select("*").execute()
+        return response.data
     except Exception as e:
-        logger.error(f"Erreur insertion: {str(e)}")
-        raise HTTPException(status_code=500, detail=str(e))
+        raise HTTPException(status_code=500, detail=f"Erreur récupération tâches: {str(e)}")
 
-@app.get("/api/pulse/latest")
-async def get_latest_pulse_data(limit: int = 10):
-    """Récupérer les dernières données de pouls"""
-    if not supabase_configured or not supabase_client:
-        raise HTTPException(status_code=503, detail="Supabase not configured")
+@app.post("/api/tasks", response_model=Task)
+async def create_task(task: Task):
+    if not supabase_client:
+        raise HTTPException(status_code=503, detail="Supabase non configuré")
     
     try:
-        result = supabase_client.table("pulse_data")\
-            .select("*")\
-            .order("timestamp", desc=True)\
-            .limit(limit)\
-            .execute()
-        
-        return {"status": "success", "data": result.data}
-        
+        task_data = task.dict(exclude={'id', 'created_at'})
+        response = supabase_client.table("tasks").insert(task_data).execute()
+        return response.data[0]
     except Exception as e:
-        logger.error(f"Erreur récupération: {str(e)}")
-        raise HTTPException(status_code=500, detail=str(e))
+        raise HTTPException(status_code=500, detail=f"Erreur création tâche: {str(e)}")
 
-@app.get("/api/metrics")
-async def get_health_metrics():
-    """Calculer et retourner les métriques de santé"""
-    if not supabase_configured or not supabase_client:
-        raise HTTPException(status_code=503, detail="Supabase not configured")
+@app.get("/api/tasks/{task_id}", response_model=Task)
+async def get_task(task_id: int):
+    if not supabase_client:
+        raise HTTPException(status_code=503, detail="Supabase non configuré")
     
     try:
-        # Récupérer toutes les données
-        result = supabase_client.table("pulse_data").select("*").execute()
-        data = result.data
-        
-        if not data:
-            return {"status": "no_data", "metrics": None}
-        
-        # Calculer les métriques
-        total_readings = len(data)
-        avg_heart_rate = sum(item["heart_rate"] for item in data) / total_readings
-        avg_temperature = sum(item["temperature"] for item in data) / total_readings
-        avg_oxygen_saturation = sum(item["oxygen_saturation"] for item in data) / total_readings
-        
-        # Dernière tension artérielle
-        latest_bp = {
-            "systolic": data[0]["blood_pressure_systolic"],
-            "diastolic": data[0]["blood_pressure_diastolic"]
-        }
-        
-        metrics = HealthMetrics(
-            avg_heart_rate=round(avg_heart_rate, 1),
-            avg_temperature=round(avg_temperature, 1),
-            avg_oxygen_saturation=round(avg_oxygen_saturation, 1),
-            latest_blood_pressure=latest_bp,
-            total_readings=total_readings
-        )
-        
-        return {"status": "success", "metrics": metrics.dict()}
-        
+        response = supabase_client.table("tasks").select("*").eq("id", task_id).execute()
+        if not response.data:
+            raise HTTPException(status_code=404, detail="Tâche non trouvée")
+        return response.data[0]
+    except HTTPException:
+        raise
     except Exception as e:
-        logger.error(f"Erreur métriques: {str(e)}")
-        raise HTTPException(status_code=500, detail=str(e))
+        raise HTTPException(status_code=500, detail=f"Erreur récupération tâche: {str(e)}")
 
-@app.get("/api/pulse/chart-data")
-async def get_chart_data(hours: int = 24):
-    """Récupérer les données pour les graphiques"""
-    if not supabase_configured or not supabase_client:
-        raise HTTPException(status_code=503, detail="Supabase not configured")
+@app.put("/api/tasks/{task_id}", response_model=Task)
+async def update_task(task_id: int, task_update: TaskUpdate):
+    if not supabase_client:
+        raise HTTPException(status_code=503, detail="Supabase non configuré")
     
     try:
-        result = supabase_client.table("pulse_data")\
-            .select("*")\
-            .order("timestamp", desc=True)\
-            .limit(hours * 6)\  # Approximativement 6 mesures par heure
-            .execute()
+        update_data = {k: v for k, v in task_update.dict().items() if v is not None}
+        if not update_data:
+            raise HTTPException(status_code=400, detail="Aucune donnée à mettre à jour")
         
-        return {"status": "success", "data": result.data}
-        
+        response = supabase_client.table("tasks").update(update_data).eq("id", task_id).execute()
+        if not response.data:
+            raise HTTPException(status_code=404, detail="Tâche non trouvée")
+        return response.data[0]
+    except HTTPException:
+        raise
     except Exception as e:
-        logger.error(f"Erreur données graphique: {str(e)}")
-        raise HTTPException(status_code=500, detail=str(e))
+        raise HTTPException(status_code=500, detail=f"Erreur mise à jour tâche: {str(e)}")
 
-# Gestion des erreurs globales
-@app.exception_handler(404)
-async def not_found_handler(request: Request, exc: HTTPException):
-    return JSONResponse(
-        status_code=404,
-        content={"error": "Endpoint not found", "path": str(request.url.path)}
-    )
+@app.delete("/api/tasks/{task_id}")
+async def delete_task(task_id: int):
+    if not supabase_client:
+        raise HTTPException(status_code=503, detail="Supabase non configuré")
+    
+    try:
+        response = supabase_client.table("tasks").delete().eq("id", task_id).execute()
+        if not response.data:
+            raise HTTPException(status_code=404, detail="Tâche non trouvée")
+        return {"message": "Tâche supprimée avec succès"}
+    except HTTPException:
+        raise
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Erreur suppression tâche: {str(e)}")
 
-@app.exception_handler(500)
-async def internal_error_handler(request: Request, exc: Exception):
-    logger.error(f"Erreur interne: {str(exc)}")
-    return JSONResponse(
-        status_code=500,
-        content={"error": "Internal server error", "detail": str(exc)}
-    )
+# Route de test
+@app.get("/api/test")
+async def test_api():
+    return {
+        "status": "API fonctionnelle",
+        "supabase": "configuré" if supabase_client else "non configuré",
+        "timestamp": datetime.utcnow().isoformat()
+    }
 
 if __name__ == "__main__":
     import uvicorn
