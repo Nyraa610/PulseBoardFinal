@@ -1,6 +1,6 @@
 from fastapi import FastAPI, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
-from supabase import create_client, Client
+from database import db
 import os
 from datetime import datetime
 from typing import Dict, Any, List, Optional
@@ -9,10 +9,6 @@ import logging
 # Configuration du logging
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
-
-# Configuration Supabase
-SUPABASE_URL = os.getenv("SUPABASE_URL")
-SUPABASE_KEY = os.getenv("SUPABASE_KEY")
 
 # Initialisation de l'application FastAPI
 app = FastAPI(title="PulseBoard API", version="1.0.0")
@@ -26,27 +22,24 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
-# Client Supabase global
-supabase: Optional[Client] = None
-
-def init_supabase():
-    """Initialise le client Supabase"""
-    global supabase
+@app.on_event("startup")
+async def startup_event():
+    """Initialisation au démarrage de l'application"""
     try:
-        if SUPABASE_URL and SUPABASE_KEY:
-            # AUCUN PARAMETRE PROXY - JUSTE URL ET KEY
-            supabase = create_client(SUPABASE_URL, SUPABASE_KEY)
-            logger.info("✅ Supabase client initialized successfully")
-            return True
-        else:
-            logger.warning("❌ Supabase credentials not found")
-            return False
+        await db.connect()
+        logger.info("✅ Database connection established successfully")
     except Exception as e:
-        logger.error(f"❌ Failed to initialize Supabase: {e}")
-        return False
+        logger.error(f"❌ Failed to connect to database: {e}")
+        raise e
 
-# Initialisation au démarrage
-init_supabase()
+@app.on_event("shutdown")
+async def shutdown_event():
+    """Nettoyage à l'arrêt de l'application"""
+    try:
+        await db.disconnect()
+        logger.info("✅ Database connection closed successfully")
+    except Exception as e:
+        logger.error(f"❌ Error closing database connection: {e}")
 
 @app.get("/")
 async def root():
@@ -54,78 +47,102 @@ async def root():
     return {
         "message": "PulseBoard API is running!",
         "version": "1.0.0",
-        "status": "active"
+        "status": "active",
+        "database": "Neon PostgreSQL"
     }
 
 @app.get("/health")
 async def health_check():
     """Vérification de l'état de l'API"""
-    return {
-        "status": "healthy",
-        "supabase_configured": supabase is not None,
-        "timestamp": datetime.now().isoformat() + "Z"
-    }
+    try:
+        # Test de connexion à la base
+        is_connected = await db.test_connection()
+        return {
+            "status": "healthy",
+            "database_connected": is_connected,
+            "database_type": "Neon PostgreSQL",
+            "timestamp": datetime.now().isoformat() + "Z"
+        }
+    except Exception as e:
+        return {
+            "status": "unhealthy",
+            "database_connected": False,
+            "error": str(e),
+            "timestamp": datetime.now().isoformat() + "Z"
+        }
 
 @app.get("/api/debug/env")
 async def debug_env():
     """Debug des variables d'environnement"""
+    database_url = os.getenv("DATABASE_URL")
     return {
-        "supabase_url": SUPABASE_URL[:50] + "..." if SUPABASE_URL else None,
-        "supabase_key_length": len(SUPABASE_KEY) if SUPABASE_KEY else 0,
-        "supabase_key_start": SUPABASE_KEY[:20] + "..." if SUPABASE_KEY else None,
-        "url_valid": bool(SUPABASE_URL and SUPABASE_URL.startswith("https://")),
-        "key_valid": bool(SUPABASE_KEY and len(SUPABASE_KEY) > 100),
-        "all_env_vars": list(os.environ.keys())
+        "database_url": database_url[:50] + "..." if database_url else None,
+        "database_url_valid": bool(database_url and database_url.startswith("postgresql://")),
+        "database_configured": bool(database_url),
+        "all_env_vars": [key for key in os.environ.keys() if not key.startswith("_")]
     }
 
-@app.get("/api/debug/supabase")
-async def debug_supabase():
-    """Debug complet de Supabase"""
+@app.get("/api/debug/database")
+async def debug_database():
+    """Debug complet de la base de données"""
     try:
+        database_url = os.getenv("DATABASE_URL")
         result = {
-            "supabase_url": SUPABASE_URL,
-            "supabase_key_length": len(SUPABASE_KEY) if SUPABASE_KEY else 0,
-            "supabase_key_start": SUPABASE_KEY[:20] + "..." if SUPABASE_KEY else None,
-            "url_valid": bool(SUPABASE_URL and SUPABASE_URL.startswith("https://")),
-            "supabase_configured": False,
-            "supabase_available": False,
-            "supabase_error": None
+            "database_url_configured": bool(database_url),
+            "database_url_valid": bool(database_url and database_url.startswith("postgresql://")),
+            "database_connected": False,
+            "database_error": None,
+            "tables_count": 0
         }
         
-        if not SUPABASE_URL or not SUPABASE_KEY:
-            result["supabase_error"] = "Missing SUPABASE_URL or SUPABASE_KEY"
+        if not database_url:
+            result["database_error"] = "Missing DATABASE_URL environment variable"
             return result
         
-        # Test de création du client Supabase - SANS PROXY
-        test_client = create_client(SUPABASE_URL, SUPABASE_KEY)
-        result["supabase_available"] = True
-        result["supabase_configured"] = True
+        # Test de connexion
+        is_connected = await db.test_connection()
+        result["database_connected"] = is_connected
+        
+        if is_connected:
+            # Compter les tables
+            tables = await db.get_tables_list()
+            result["tables_count"] = len(tables) if tables else 0
+            result["tables"] = tables
         
         return result
         
     except Exception as e:
-        result["supabase_error"] = str(e)
-        return result
+        return {
+            "database_connected": False,
+            "database_error": str(e),
+            "timestamp": datetime.now().isoformat()
+        }
 
 @app.get("/api/test")
 async def test_api():
     """Test général de l'API"""
-    return {
-        "api_status": "working",
-        "supabase_status": "configured" if supabase else "not_configured",
-        "timestamp": datetime.now().isoformat()
-    }
+    try:
+        is_connected = await db.test_connection()
+        return {
+            "api_status": "working",
+            "database_status": "connected" if is_connected else "disconnected",
+            "timestamp": datetime.now().isoformat()
+        }
+    except Exception as e:
+        return {
+            "api_status": "working",
+            "database_status": "error",
+            "error": str(e),
+            "timestamp": datetime.now().isoformat()
+        }
 
 # Routes pour les événements
 @app.get("/api/events")
 async def get_events():
     """Récupère tous les événements"""
-    if not supabase:
-        raise HTTPException(status_code=500, detail="Supabase not configured")
-    
     try:
-        response = supabase.table("events").select("*").execute()
-        return {"events": response.data}
+        events = await db.get_all_events()
+        return {"events": events}
     except Exception as e:
         logger.error(f"Error fetching events: {e}")
         raise HTTPException(status_code=500, detail=str(e))
@@ -133,41 +150,151 @@ async def get_events():
 @app.post("/api/events")
 async def create_event(event_data: Dict[str, Any]):
     """Crée un nouvel événement"""
-    if not supabase:
-        raise HTTPException(status_code=500, detail="Supabase not configured")
-    
     try:
-        response = supabase.table("events").insert(event_data).execute()
-        return {"message": "Event created successfully", "data": response.data}
+        # Validation des données requises
+        required_fields = ['name', 'city_id', 'event_date']
+        for field in required_fields:
+            if field not in event_data:
+                raise HTTPException(status_code=400, detail=f"Missing required field: {field}")
+        
+        event_id = await db.save_event_data(
+            city_id=event_data['city_id'],
+            event_data=event_data
+        )
+        return {"message": "Event created successfully", "event_id": event_id}
     except Exception as e:
         logger.error(f"Error creating event: {e}")
         raise HTTPException(status_code=500, detail=str(e))
 
-# Routes pour les métriques
+@app.get("/api/events/city/{city_id}")
+async def get_events_by_city(city_id: int):
+    """Récupère les événements d'une ville"""
+    try:
+        events = await db.get_events_by_city(city_id)
+        return {"events": events}
+    except Exception as e:
+        logger.error(f"Error fetching events for city {city_id}: {e}")
+        raise HTTPException(status_code=500, detail=str(e))
+
+# Routes pour les métriques (données météo)
 @app.get("/api/metrics")
 async def get_metrics():
-    """Récupère toutes les métriques"""
-    if not supabase:
-        raise HTTPException(status_code=500, detail="Supabase not configured")
-    
+    """Récupère toutes les métriques météo"""
     try:
-        response = supabase.table("metrics").select("*").execute()
-        return {"metrics": response.data}
+        metrics = await db.get_all_weather_data()
+        return {"metrics": metrics}
     except Exception as e:
         logger.error(f"Error fetching metrics: {e}")
         raise HTTPException(status_code=500, detail=str(e))
 
 @app.post("/api/metrics")
 async def create_metric(metric_data: Dict[str, Any]):
-    """Crée une nouvelle métrique"""
-    if not supabase:
-        raise HTTPException(status_code=500, detail="Supabase not configured")
-    
+    """Crée une nouvelle métrique météo"""
     try:
-        response = supabase.table("metrics").insert(metric_data).execute()
-        return {"message": "Metric created successfully", "data": response.data}
+        # Validation des données requises
+        required_fields = ['city_id', 'temperature', 'humidity']
+        for field in required_fields:
+            if field not in metric_data:
+                raise HTTPException(status_code=400, detail=f"Missing required field: {field}")
+        
+        metric_id = await db.save_weather_data(
+            city_id=metric_data['city_id'],
+            weather_data=metric_data
+        )
+        return {"message": "Metric created successfully", "metric_id": metric_id}
     except Exception as e:
         logger.error(f"Error creating metric: {e}")
+        raise HTTPException(status_code=500, detail=str(e))
+
+@app.get("/api/metrics/city/{city_id}")
+async def get_metrics_by_city(city_id: int):
+    """Récupère les métriques météo d'une ville"""
+    try:
+        metrics = await db.get_weather_by_city(city_id)
+        return {"metrics": metrics}
+    except Exception as e:
+        logger.error(f"Error fetching metrics for city {city_id}: {e}")
+        raise HTTPException(status_code=500, detail=str(e))
+
+# Routes pour les villes
+@app.get("/api/cities")
+async def get_cities():
+    """Récupère toutes les villes"""
+    try:
+        cities = await db.get_all_cities()
+        return {"cities": cities}
+    except Exception as e:
+        logger.error(f"Error fetching cities: {e}")
+        raise HTTPException(status_code=500, detail=str(e))
+
+@app.get("/api/cities/{city_name}")
+async def get_city_by_name(city_name: str):
+    """Récupère une ville par son nom"""
+    try:
+        city = await db.get_city_by_name(city_name)
+        if not city:
+            raise HTTPException(status_code=404, detail="City not found")
+        return {"city": city}
+    except Exception as e:
+        logger.error(f"Error fetching city {city_name}: {e}")
+        raise HTTPException(status_code=500, detail=str(e))
+
+@app.post("/api/cities")
+async def create_city(city_data: Dict[str, Any]):
+    """Crée une nouvelle ville"""
+    try:
+        # Validation des données requises
+        required_fields = ['name', 'country', 'latitude', 'longitude']
+        for field in required_fields:
+            if field not in city_data:
+                raise HTTPException(status_code=400, detail=f"Missing required field: {field}")
+        
+        city_id = await db.save_city_data(city_data)
+        return {"message": "City created successfully", "city_id": city_id}
+    except Exception as e:
+        logger.error(f"Error creating city: {e}")
+        raise HTTPException(status_code=500, detail=str(e))
+
+# Routes pour les scores urbains
+@app.get("/api/urban-scores")
+async def get_urban_scores():
+    """Récupère tous les scores urbains"""
+    try:
+        scores = await db.get_all_urban_scores()
+        return {"urban_scores": scores}
+    except Exception as e:
+        logger.error(f"Error fetching urban scores: {e}")
+        raise HTTPException(status_code=500, detail=str(e))
+
+@app.get("/api/urban-scores/city/{city_id}")
+async def get_urban_score_by_city(city_id: int):
+    """Récupère le dernier score urbain d'une ville"""
+    try:
+        score = await db.get_latest_urban_score(city_id)
+        if not score:
+            raise HTTPException(status_code=404, detail="No urban score found for this city")
+        return {"urban_score": score}
+    except Exception as e:
+        logger.error(f"Error fetching urban score for city {city_id}: {e}")
+        raise HTTPException(status_code=500, detail=str(e))
+
+@app.post("/api/urban-scores")
+async def create_urban_score(score_data: Dict[str, Any]):
+    """Crée un nouveau score urbain"""
+    try:
+        # Validation des données requises
+        required_fields = ['city_id', 'overall_score']
+        for field in required_fields:
+            if field not in score_data:
+                raise HTTPException(status_code=400, detail=f"Missing required field: {field}")
+        
+        score_id = await db.save_urban_score(
+            city_id=score_data['city_id'],
+            score_data=score_data
+        )
+        return {"message": "Urban score created successfully", "score_id": score_id}
+    except Exception as e:
+        logger.error(f"Error creating urban score: {e}")
         raise HTTPException(status_code=500, detail=str(e))
 
 if __name__ == "__main__":
