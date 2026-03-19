@@ -1,192 +1,287 @@
-import asyncpg
 import os
-from typing import Optional, List, Dict, Any
-import json
+import asyncpg
+import logging
 from datetime import datetime
+from typing import Dict, Any, List, Optional
+
+# Configuration du logging
+logger = logging.getLogger(__name__)
 
 class DatabaseManager:
     def __init__(self):
-        self.connection_string = os.getenv("DATABASE_URL")
-        if not self.connection_string:
+        self.database_url = os.getenv("DATABASE_URL")
+        if not self.database_url:
             raise ValueError("DATABASE_URL environment variable is required")
-    
-    async def get_connection(self):
-        """Crée une connexion à la base de données"""
-        return await asyncpg.connect(self.connection_string)
-    
-    async def execute_query(self, query: str, *args) -> List[Dict[str, Any]]:
-        """Exécute une requête SELECT et retourne les résultats"""
-        conn = await self.get_connection()
+        self.pool = None
+        logger.info("✅ DatabaseManager initialized with Neon PostgreSQL")
+
+    async def connect(self):
+        """Établit la connexion à la base de données"""
         try:
-            rows = await conn.fetch(query, *args)
-            return [dict(row) for row in rows]
-        finally:
-            await conn.close()
-    
-    async def execute_command(self, command: str, *args) -> str:
-        """Exécute une commande INSERT/UPDATE/DELETE"""
-        conn = await self.get_connection()
+            if not self.pool:
+                self.pool = await asyncpg.create_pool(
+                    self.database_url,
+                    min_size=1,
+                    max_size=10,
+                    command_timeout=60
+                )
+                logger.info("✅ Connected to Neon PostgreSQL database")
+            return True
+        except Exception as e:
+            logger.error(f"❌ Failed to connect to database: {e}")
+            return False
+
+    async def disconnect(self):
+        """Ferme la connexion à la base de données"""
+        if self.pool:
+            await self.pool.close()
+            self.pool = None
+            logger.info("✅ Disconnected from database")
+
+    async def execute_query(self, query: str, *args):
+        """Exécute une requête avec paramètres"""
+        if not self.pool:
+            await self.connect()
+        
         try:
-            result = await conn.execute(command, *args)
-            return result
-        finally:
-            await conn.close()
+            async with self.pool.acquire() as connection:
+                return await connection.fetch(query, *args)
+        except Exception as e:
+            logger.error(f"❌ Query execution failed: {e}")
+            raise
+
+    async def execute_single(self, query: str, *args):
+        """Exécute une requête qui retourne un seul résultat"""
+        if not self.pool:
+            await self.connect()
+        
+        try:
+            async with self.pool.acquire() as connection:
+                return await connection.fetchrow(query, *args)
+        except Exception as e:
+            logger.error(f"❌ Single query execution failed: {e}")
+            raise
+
+    async def execute_command(self, query: str, *args):
+        """Exécute une commande (INSERT, UPDATE, DELETE)"""
+        if not self.pool:
+            await self.connect()
+        
+        try:
+            async with self.pool.acquire() as connection:
+                return await connection.execute(query, *args)
+        except Exception as e:
+            logger.error(f"❌ Command execution failed: {e}")
+            raise
+
+    # ===============================
+    # MÉTHODES POUR LES VILLES
+    # ===============================
     
-    # CITIES
-    async def get_cities(self) -> List[Dict[str, Any]]:
+    async def get_all_cities(self):
         """Récupère toutes les villes"""
         query = "SELECT * FROM cities ORDER BY name"
         return await self.execute_query(query)
-    
-    async def get_city_by_name(self, name: str) -> Optional[Dict[str, Any]]:
+
+    async def get_city_by_name(self, name: str):
         """Récupère une ville par son nom"""
-        query = "SELECT * FROM cities WHERE name = $1"
-        results = await self.execute_query(query, name)
-        return results[0] if results else None
-    
-    async def create_city(self, name: str, latitude: float, longitude: float, 
-                         country_code: str = "FR", timezone: str = "Europe/Paris") -> int:
+        query = "SELECT * FROM cities WHERE LOWER(name) = LOWER($1)"
+        return await self.execute_single(query, name)
+
+    async def get_city_by_id(self, city_id: int):
+        """Récupère une ville par son ID"""
+        query = "SELECT * FROM cities WHERE id = $1"
+        return await self.execute_single(query, city_id)
+
+    async def create_city(self, name: str, country: str, latitude: float, longitude: float):
         """Crée une nouvelle ville"""
         query = """
-        INSERT INTO cities (name, latitude, longitude, country_code, timezone)
-        VALUES ($1, $2, $3, $4, $5) RETURNING id
+        INSERT INTO cities (name, country, latitude, longitude, created_at)
+        VALUES ($1, $2, $3, $4, NOW())
+        RETURNING *
         """
-        conn = await self.get_connection()
-        try:
-            city_id = await conn.fetchval(query, name, latitude, longitude, country_code, timezone)
-            return city_id
-        finally:
-            await conn.close()
+        return await self.execute_single(query, name, country, latitude, longitude)
+
+    # ===============================
+    # MÉTHODES POUR LES ÉVÉNEMENTS
+    # ===============================
     
-    # WEATHER DATA
-    async def save_weather_data(self, city_id: int, weather_data: Dict[str, Any]) -> None:
-        """Sauvegarde les données météo"""
+    async def get_all_events(self):
+        """Récupère tous les événements"""
         query = """
-        INSERT INTO weather_data (
-            city_id, timestamp, temperature, feels_like, humidity, pressure,
-            wind_speed, wind_direction, weather_main, weather_description,
-            icon, visibility, uv_index
-        ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13)
+        SELECT e.*, c.name as city_name 
+        FROM events e 
+        LEFT JOIN cities c ON e.city_id = c.id 
+        ORDER BY e.start_date DESC
         """
-        await self.execute_command(
-            query, city_id, datetime.now(), weather_data.get('temperature'),
-            weather_data.get('feels_like'), weather_data.get('humidity'),
-            weather_data.get('pressure'), weather_data.get('wind_speed'),
-            weather_data.get('wind_direction'), weather_data.get('weather_main'),
-            weather_data.get('weather_description'), weather_data.get('icon'),
-            weather_data.get('visibility'), weather_data.get('uv_index')
-        )
-    
-    async def get_latest_weather(self, city_id: int) -> Optional[Dict[str, Any]]:
-        """Récupère les dernières données météo pour une ville"""
-        query = """
-        SELECT * FROM weather_data 
-        WHERE city_id = $1 
-        ORDER BY timestamp DESC 
-        LIMIT 1
-        """
-        results = await self.execute_query(query, city_id)
-        return results[0] if results else None
-    
-    # AIR QUALITY
-    async def save_air_quality(self, city_id: int, air_data: Dict[str, Any]) -> None:
-        """Sauvegarde les données de qualité de l'air"""
-        query = """
-        INSERT INTO air_quality (
-            city_id, timestamp, aqi, pm25, pm10, no2, o3, co, so2, health_advice
-        ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10)
-        """
-        await self.execute_command(
-            query, city_id, datetime.now(), air_data.get('aqi'),
-            air_data.get('pm25'), air_data.get('pm10'), air_data.get('no2'),
-            air_data.get('o3'), air_data.get('co'), air_data.get('so2'),
-            air_data.get('health_advice')
-        )
-    
-    async def get_latest_air_quality(self, city_id: int) -> Optional[Dict[str, Any]]:
-        """Récupère les dernières données de qualité de l'air"""
-        query = """
-        SELECT * FROM air_quality 
-        WHERE city_id = $1 
-        ORDER BY timestamp DESC 
-        LIMIT 1
-        """
-        results = await self.execute_query(query, city_id)
-        return results[0] if results else None
-    
-    # EVENTS
-    async def save_event(self, city_id: int, event_data: Dict[str, Any]) -> None:
-        """Sauvegarde un événement"""
-        query = """
-        INSERT INTO events (
-            city_id, title, description, start_date, end_date, 
-            location, category, source, external_id, url
-        ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10)
-        """
-        await self.execute_command(
-            query, city_id, event_data.get('title'), event_data.get('description'),
-            event_data.get('start_date'), event_data.get('end_date'),
-            event_data.get('location'), event_data.get('category'),
-            event_data.get('source'), event_data.get('external_id'),
-            event_data.get('url')
-        )
-    
-    async def get_city_events(self, city_id: int, limit: int = 10) -> List[Dict[str, Any]]:
+        return await self.execute_query(query)
+
+    async def get_events_by_city(self, city_id: int):
         """Récupère les événements d'une ville"""
         query = """
-        SELECT * FROM events 
-        WHERE city_id = $1 AND start_date >= NOW()
-        ORDER BY start_date ASC 
-        LIMIT $2
+        SELECT e.*, c.name as city_name 
+        FROM events e 
+        LEFT JOIN cities c ON e.city_id = c.id 
+        WHERE e.city_id = $1 
+        ORDER BY e.start_date DESC
         """
-        return await self.execute_query(query, city_id, limit)
+        return await self.execute_query(query, city_id)
+
+    async def create_event(self, event_data: Dict[str, Any]):
+        """Crée un nouvel événement"""
+        query = """
+        INSERT INTO events (title, description, start_date, end_date, location, 
+                          category, price, city_id, external_id, source, created_at)
+        VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, NOW())
+        RETURNING *
+        """
+        return await self.execute_single(
+            query,
+            event_data.get('title'),
+            event_data.get('description'),
+            event_data.get('start_date'),
+            event_data.get('end_date'),
+            event_data.get('location'),
+            event_data.get('category'),
+            event_data.get('price'),
+            event_data.get('city_id'),
+            event_data.get('external_id'),
+            event_data.get('source', 'manual')
+        )
+
+    # ===============================
+    # MÉTHODES POUR LES MÉTRIQUES
+    # ===============================
     
-    # URBAN SCORES
-    async def save_urban_score(self, city_id: int, score_data: Dict[str, Any]) -> None:
+    async def get_all_metrics(self):
+        """Récupère toutes les métriques"""
+        query = """
+        SELECT m.*, c.name as city_name 
+        FROM metrics m 
+        LEFT JOIN cities c ON m.city_id = c.id 
+        ORDER BY m.recorded_at DESC
+        """
+        return await self.execute_query(query)
+
+    async def get_metrics_by_city(self, city_id: int):
+        """Récupère les métriques d'une ville"""
+        query = """
+        SELECT m.*, c.name as city_name 
+        FROM metrics m 
+        LEFT JOIN cities c ON m.city_id = c.id 
+        WHERE m.city_id = $1 
+        ORDER BY m.recorded_at DESC
+        """
+        return await self.execute_query(query, city_id)
+
+    async def create_metric(self, metric_data: Dict[str, Any]):
+        """Crée une nouvelle métrique"""
+        query = """
+        INSERT INTO metrics (city_id, metric_type, value, unit, source, recorded_at)
+        VALUES ($1, $2, $3, $4, $5, NOW())
+        RETURNING *
+        """
+        return await self.execute_single(
+            query,
+            metric_data.get('city_id'),
+            metric_data.get('metric_type'),
+            metric_data.get('value'),
+            metric_data.get('unit'),
+            metric_data.get('source', 'manual')
+        )
+
+    # ===============================
+    # MÉTHODES POUR LES SCORES URBAINS
+    # ===============================
+    
+    async def get_all_urban_scores(self):
+        """Récupère tous les scores urbains"""
+        query = """
+        SELECT us.*, c.name as city_name 
+        FROM urban_scores us 
+        LEFT JOIN cities c ON us.city_id = c.id 
+        ORDER BY us.calculated_at DESC
+        """
+        return await self.execute_query(query)
+
+    async def get_urban_score_by_city(self, city_id: int):
+        """Récupère le score urbain d'une ville"""
+        query = """
+        SELECT us.*, c.name as city_name 
+        FROM urban_scores us 
+        LEFT JOIN cities c ON us.city_id = c.id 
+        WHERE us.city_id = $1 
+        ORDER BY us.calculated_at DESC 
+        LIMIT 1
+        """
+        return await self.execute_single(query, city_id)
+
+    async def save_urban_score(self, city_id: int, score_data: Dict[str, Any]):
         """Sauvegarde un score urbain"""
         query = """
         INSERT INTO urban_scores (
-            city_id, date, score, weather_score, air_quality_score, 
-            events_score, calculation_details
-        ) VALUES ($1, $2, $3, $4, $5, $6, $7)
-        """
-        await self.execute_command(
-            query, city_id, datetime.now().date(), score_data.get('score'),
-            score_data.get('weather_score'), score_data.get('air_quality_score'),
-            score_data.get('events_score'), json.dumps(score_data.get('calculation_details', {}))
+            city_id, overall_score, weather_score, air_quality_score, 
+            events_score, transport_score, calculated_at
         )
+        VALUES ($1, $2, $3, $4, $5, $6, NOW())
+        RETURNING *
+        """
+        return await self.execute_single(
+            query,
+            city_id,
+            score_data.get('overall_score'),
+            score_data.get('weather_score'),
+            score_data.get('air_quality_score'),
+            score_data.get('events_score'),
+            score_data.get('transport_score')
+        )
+
+    # ===============================
+    # MÉTHODES POUR LES DONNÉES MÉTÉO
+    # ===============================
     
-    async def get_latest_urban_score(self, city_id: int) -> Optional[Dict[str, Any]]:
-        """Récupère le dernier score urbain"""
+    async def save_weather_data(self, city_id: int, weather_data: Dict[str, Any]):
+        """Sauvegarde les données météo"""
         query = """
-        SELECT * FROM urban_scores 
+        INSERT INTO weather_data (
+            city_id, temperature, humidity, pressure, wind_speed, 
+            weather_condition, recorded_at
+        )
+        VALUES ($1, $2, $3, $4, $5, $6, NOW())
+        RETURNING *
+        """
+        return await self.execute_single(
+            query,
+            city_id,
+            weather_data.get('temperature'),
+            weather_data.get('humidity'),
+            weather_data.get('pressure'),
+            weather_data.get('wind_speed'),
+            weather_data.get('weather_condition')
+        )
+
+    async def get_latest_weather(self, city_id: int):
+        """Récupère les dernières données météo d'une ville"""
+        query = """
+        SELECT * FROM weather_data 
         WHERE city_id = $1 
-        ORDER BY date DESC 
+        ORDER BY recorded_at DESC 
         LIMIT 1
         """
-        results = await self.execute_query(query, city_id)
-        return results[0] if results else None
+        return await self.execute_single(query, city_id)
+
+    # ===============================
+    # MÉTHODES DE TEST
+    # ===============================
     
-    # PULSE DATA (pour compatibilité)
-    async def save_pulse_data(self, city: str, data_type: str, data: Dict[str, Any]) -> None:
-        """Sauvegarde des données pulse"""
-        query = """
-        INSERT INTO pulse_data (city, data_type, data)
-        VALUES ($1, $2, $3)
-        """
-        await self.execute_command(query, city, data_type, json.dumps(data))
-    
-    # API LOGS
-    async def log_api_call(self, endpoint: str, city_id: Optional[int] = None, 
-                          response_time_ms: Optional[int] = None, 
-                          status_code: Optional[int] = None,
-                          error_message: Optional[str] = None) -> None:
-        """Log un appel API"""
-        query = """
-        INSERT INTO api_logs (endpoint, city_id, response_time_ms, status_code, error_message)
-        VALUES ($1, $2, $3, $4, $5)
-        """
-        await self.execute_command(query, endpoint, city_id, response_time_ms, status_code, error_message)
+    async def test_connection(self):
+        """Test la connexion à la base de données"""
+        try:
+            await self.connect()
+            result = await self.execute_single("SELECT 1 as test")
+            return {"status": "success", "test_result": dict(result) if result else None}
+        except Exception as e:
+            return {"status": "error", "error": str(e)}
 
 # Instance globale
 db = DatabaseManager()
